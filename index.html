@@ -64,11 +64,14 @@ function cloudMsg(s){const el=$('#cloudStatus');if(el)el.textContent=s}
 function cloudPayload(){const copy=JSON.parse(JSON.stringify(data));delete copy.pin;return copy}
 function mergeCloud(local,remote){
   const out={...remote,...local};
+  const deleted=new Set([...(remote.deletedEntries||[]),...(local.deletedEntries||[])]);
+  out.deletedEntries=[...deleted];
   for(const k of ['entries','habits','custom','books','words','recipes']){
     if(Array.isArray(local[k])&&Array.isArray(remote[k])){
       const m=new Map(); remote[k].forEach((x,i)=>m.set(x.id||`${k}:${i}:${x.name||x.title||''}`,x));
       local[k].forEach((x,i)=>m.set(x.id||`${k}:${i}:${x.name||x.title||''}`,x));
       out[k]=[...m.values()];
+      if(k==='entries') out[k]=out[k].filter(x=>!deleted.has(x.id));
     }
   }
   out.tasks={...(remote.tasks||{}),...(local.tasks||{})};
@@ -131,7 +134,7 @@ $('#bgAction').onclick=()=>{$('#entryExtras').innerHTML=`<div class="field"><lab
 $('#fontAction').onclick=()=>{$('#entryExtras').innerHTML=`<div class="field"><label>WRITING FONT</label><select id="eFont">${['Georgia','Palatino Linotype','Times New Roman','Arial','Trebuchet MS','Courier New'].map(x=>`<option ${x===font?'selected':''}>${x}</option>`).join('')}</select></div>`;$('#eFont').onchange=e=>{font=e.target.value;$('#eBody').style.fontFamily=font}};
 $('#saveEntry').onclick=()=>{let item={id:id||crypto.randomUUID(),date:$('#eDate').value,title:$('#eTitle').value,body:$('#eBody').value,mood:$('#eMood').value,image:entryImage,audio:voiceData,sticker,bg};if(!item.date){toast('Choose a date first');return}let i=data.entries.findIndex(x=>x.id===item.id);i>=0?data.entries[i]=item:data.entries.push(item);save();renderEntries();closeModal();toast('Your memory is saved ♥')};
 $('#cancelEntry').onclick=closeModal;if(id)$('#removeEntry').onclick=()=>deleteEntry(id)}
-window.editEntry=id=>entryForm(id);window.deleteEntry=id=>{if(confirm('Delete this diary entry?')){data.entries=data.entries.filter(x=>x.id!==id);save();renderEntries();closeModal();toast('Entry deleted')}}
+window.editEntry=id=>entryForm(id);window.deleteEntry=id=>{if(confirm('Delete this diary entry?')){data.deletedEntries=Array.isArray(data.deletedEntries)?data.deletedEntries:[];if(!data.deletedEntries.includes(id))data.deletedEntries.push(id);data.entries=data.entries.filter(x=>x.id!==id);save();renderEntries();closeModal();toast('Entry deleted')}}
 function showDrawer(){$('#drawerBack').classList.add('show')}function hideDrawer(){$('#drawerBack').classList.remove('show')}
 function buildMenu(){$('#menuItems').innerHTML=menu.map(([n,ic,k])=>`<button class="menuitem" data-module="${k}"><b>${ic}</b><span>${n}</span></button>`).join('');$$('[data-module]').forEach(b=>b.onclick=()=>{hideDrawer();module(b.dataset.module)})}
 function page(title,sub=''){openModal(title,`<p class="muted">${sub}</p><div id="moduleContent"></div>`);return $('#moduleContent')}
