@@ -31,7 +31,7 @@
 </style>
 </head>
 <body>
-<div id="lockscreen" class="lockscreen"><div class="lockbox"><div style="font-size:43px;color:var(--accent)">✧</div><h1 id="lockTitle">Welcome to your diary</h1><p class="muted" id="lockHint">Create a 4-digit PIN for your private space.</p><div class="pinrow"><input inputmode="numeric" maxlength="1" class="pin" aria-label="PIN digit 1"><input inputmode="numeric" maxlength="1" class="pin" aria-label="PIN digit 2"><input inputmode="numeric" maxlength="1" class="pin" aria-label="PIN digit 3"><input inputmode="numeric" maxlength="1" class="pin" aria-label="PIN digit 4"></div><button class="primary" id="unlockBtn">Continue</button><p class="footnote">Your diary is stored on this device. A PIN is a convenience lock, not encryption. Export backups regularly.</p></div></div>
+<div id="lockscreen" class="lockscreen"><div class="lockbox"><div style="font-size:43px;color:var(--accent)">✧</div><h1 id="lockTitle">Welcome to your diary</h1><p class="muted" id="lockHint">Create a 4-digit PIN for your private space.</p><div class="pinrow"><input inputmode="numeric" maxlength="1" class="pin" aria-label="PIN digit 1"><input inputmode="numeric" maxlength="1" class="pin" aria-label="PIN digit 2"><input inputmode="numeric" maxlength="1" class="pin" aria-label="PIN digit 3"><input inputmode="numeric" maxlength="1" class="pin" aria-label="PIN digit 4"></div><button class="primary" id="unlockBtn">Continue</button><button class="secondary" id="googleLogin" style="margin-top:12px;width:100%">Continue with Google</button><p class="muted" id="cloudStatus" style="margin-top:10px">Cloud sync: not connected</p><p class="footnote">Your 4-digit PIN stays on this device. Sign in with Google to sync your diary across devices. Keep a backup too.</p></div></div>
 <div class="app">
 <header class="top"><div class="brand">My Diary</div><div class="topright"><button class="iconbtn" id="searchBtn" aria-label="Search diary">⌕</button><button class="iconbtn" id="menuBtn" aria-label="Open menu">☰</button></div></header>
 <main id="mainView"><section class="hero"><small>A little thought for today</small><p id="dailyPrompt">Your story matters, even on the quiet days.</p><small class="daycount" id="dailyNumber">DAY 001 / 365</small></section><div class="entrylist" id="entryList"></div></main>
@@ -39,6 +39,7 @@
 </div>
 <div class="drawerback" id="drawerBack"><aside class="drawer"><div class="drawerhead"><span>My little world</span><button class="close" id="closeDrawer">×</button></div><p class="muted">Your tools, tucked away.</p><div id="menuItems"></div><p class="footnote">A private space for your thoughts, plans and little discoveries.</p></aside></div>
 <div class="modalback" id="modalBack"><section class="modal"><div class="modalhead"><h2 id="modalTitle">Diary</h2><button class="close" id="closeModal">×</button></div><div id="modalBody"></div></section></div><div class="toast" id="toast"></div>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 'use strict';
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)],KEY='dearDiaryPremium_v2';
@@ -53,6 +54,63 @@ function fresh(){return {entries:[],tasks:{daily:[],weekly:[],monthly:[]},habits
 function load(){try{return {...fresh(),...JSON.parse(localStorage.getItem(KEY)||'{}')}}catch(e){return fresh()}}
 let data=load(),pinStage='unlock',recording=null,voiceData='',entryImage='',installPrompt=null;
 function save(){try{localStorage.setItem(KEY,JSON.stringify(data))}catch(e){toast('Storage is full. Export a backup and remove large attachments.');}}
+// Cloud sync runs after local save; local storage remains the immediate safety copy.
+save = function(){ saveLocalOnly(); queueCloudSync(); };
+const SUPABASE_URL='https://zevfluhdfjqcutotfjio.supabase.co';
+const SUPABASE_ANON_KEY='sb_publishable_H5AO68QblZ7LApJGIOlyFA_YNUYpnDj';
+const supabaseClient=window.supabase?.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);
+let cloudUser=null, syncTimer=null, syncing=false, lastCloudSync=0;
+function cloudMsg(s){const el=$('#cloudStatus');if(el)el.textContent=s}
+function cloudPayload(){const copy=JSON.parse(JSON.stringify(data));delete copy.pin;return copy}
+function mergeCloud(local,remote){
+  const out={...remote,...local};
+  for(const k of ['entries','habits','custom','books','words','recipes']){
+    if(Array.isArray(local[k])&&Array.isArray(remote[k])){
+      const m=new Map(); remote[k].forEach((x,i)=>m.set(x.id||`${k}:${i}:${x.name||x.title||''}`,x));
+      local[k].forEach((x,i)=>m.set(x.id||`${k}:${i}:${x.name||x.title||''}`,x));
+      out[k]=[...m.values()];
+    }
+  }
+  out.tasks={...(remote.tasks||{}),...(local.tasks||{})};
+  for(const k of ['daily','weekly','monthly']){const a=(remote.tasks||{})[k]||[],b=(local.tasks||{})[k]||[],m=new Map();a.forEach((x,i)=>m.set(x.id||`${k}:${i}:${x.text||x.title||''}`,x));b.forEach((x,i)=>m.set(x.id||`${k}:${i}:${x.text||x.title||''}`,x));out.tasks[k]=[...m.values()];}
+  out.pin=local.pin||null;
+  return out;
+}
+async function syncCloud({quiet=false}={}){
+  if(!supabaseClient||!cloudUser){cloudMsg('Sign in with Google to enable cloud sync');return false}
+  if(syncing)return false;
+  syncing=true;cloudMsg('Syncing…');
+  try{
+    const {data:row,error}=await supabaseClient.from('diary_data').select('payload,updated_at').eq('user_id',cloudUser.id).maybeSingle();
+    if(error)throw error;
+    if(row?.payload){
+      data=mergeCloud(data,row.payload);
+      saveLocalOnly();
+      const {error:upErr}=await supabaseClient.from('diary_data').upsert({user_id:cloudUser.id,payload:cloudPayload(),updated_at:new Date().toISOString()},{onConflict:'user_id'});
+      if(upErr)throw upErr;
+      applyTheme();renderEntries();
+    }else{
+      const {error:upErr}=await supabaseClient.from('diary_data').upsert({user_id:cloudUser.id,payload:cloudPayload(),updated_at:new Date().toISOString()},{onConflict:'user_id'});
+      if(upErr)throw upErr;
+    }
+    lastCloudSync=Date.now();cloudMsg('Cloud sync complete ✓');return true;
+  }catch(e){console.error(e);cloudMsg('Sync failed: '+(e.message||'Please check connection'));if(!quiet)toast('Cloud sync failed. Your phone copy is safe.');return false}
+  finally{syncing=false}
+}
+function saveLocalOnly(){try{localStorage.setItem(KEY,JSON.stringify(data))}catch(e){toast('Storage is full. Export a backup and remove large attachments.');}}
+function queueCloudSync(){if(!cloudUser)return;clearTimeout(syncTimer);syncTimer=setTimeout(()=>syncCloud({quiet:true}),1800)}
+async function initCloud(){
+  if(!supabaseClient){cloudMsg('Cloud service could not load');return}
+  const {data:{session}}=await supabaseClient.auth.getSession();
+  cloudUser=session?.user||null;
+  if(cloudUser){cloudMsg('Signed in: '+(cloudUser.email||'Google account'));if(!$('#lockscreen').classList.contains('hidden')){}else await syncCloud({quiet:true})}
+  supabaseClient.auth.onAuthStateChange((event,session)=>{
+    cloudUser=session?.user||null;
+    if(cloudUser){cloudMsg('Signed in: '+(cloudUser.email||'Google account'));if($('#lockscreen').classList.contains('hidden'))setTimeout(()=>syncCloud({quiet:true}),0)}
+    else cloudMsg('Cloud sync: not connected');
+  });
+}
+
 function esc(s=''){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function toast(s){let t=$('#toast');t.textContent=s;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600)}
 function applyTheme(){let t=themes[Math.max(0,Math.min(14,+data.theme||0))],r=document.documentElement.style;r.setProperty('--bg',t[1]);r.setProperty('--surface',t[2]);r.setProperty('--surface2',mix(t[1],t[4]));r.setProperty('--ink',t[3]);r.setProperty('--accent',t[4]);r.setProperty('--accent2',t[5]);r.setProperty('--serif',data.font||'Georgia,serif')}
@@ -87,10 +145,16 @@ function simpleList(title,key,placeholder,detail){let c=page(title,'Keep useful 
 function todoPage(period){let title={daily:'Daily to-do list',weekly:'Weekly to-do list',monthly:'Monthly to-do list'}[period],c=page(title,'Plan your tasks and tick them off as you go.');data.tasks[period]=data.tasks[period]||[];c.innerHTML=`<div class="field"><label>ADD A TASK</label><input id="taskName" placeholder="What needs to get done?"></div><button class="primary" id="addTask">Add task</button><div id="taskRows"></div>`;function draw(){$('#taskRows').innerHTML=data.tasks[period].map((t,i)=>`<div class="listrow"><label class="checkrow"><input type="checkbox" data-tick="${i}" ${t.done?'checked':''}><span style="${t.done?'text-decoration:line-through;opacity:.55':''}">${esc(t.name)}</span></label><button class="tiny" data-tremove="${i}">×</button></div>`).join('')||'<div class="empty">Your list is clear. Enjoy the space.</div>';$$('[data-tick]').forEach(x=>x.onchange=()=>{data.tasks[period][+x.dataset.tick].done=x.checked;save();draw()});$$('[data-tremove]').forEach(x=>x.onclick=()=>{data.tasks[period].splice(+x.dataset.tremove,1);save();draw()})}$('#addTask').onclick=()=>{let n=$('#taskName').value.trim();if(n){data.tasks[period].push({name:n,done:false});save();$('#taskName').value='';draw()}};draw()}
 function searchPage(){let c=page('Search diary','Find memories by title or words in your entries.');c.innerHTML=`<div class="field"><input id="searchText" placeholder="Search your diary..."></div><div id="searchResults"></div>`;$('#searchText').oninput=()=>{let q=$('#searchText').value.toLowerCase(),es=data.entries.filter(e=>(e.title+' '+e.body).toLowerCase().includes(q));$('#searchResults').innerHTML=es.map(e=>`<div class="listrow"><div><strong>${esc(e.title||'Untitled')}</strong><small>${esc(e.date)} · ${esc(e.body.slice(0,90))}</small></div><button class="tiny" onclick="editEntry('${e.id}')">Open</button></div>`).join('')||'<p class="muted">No matching entries.</p>'}}
 function storagePage(){let c=page('Storage & backup','Export a backup file or restore one on this device.');c.innerHTML=`<div class="tile"><strong>${data.entries.length} diary entries</strong><span class="muted">${data.habits.length} habits · ${data.books.length} books · ${data.words.length} words · ${data.recipes.length} recipes</span></div><div class="actions"><button class="primary" id="exportData">Export backup (.json)</button><label class="secondary" style="display:inline-flex;align-items:center">Import backup<input id="importData" type="file" accept="application/json" hidden></label></div><p class="footnote">Backups include text, settings, tasks and attachments. Keep exported files somewhere private. Importing replaces the current app data.</p>`;$('#exportData').onclick=()=>{let b=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='dear-diary-backup.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};$('#importData').onchange=e=>{let f=e.target.files[0];if(!f)return;let r=new FileReader();r.onload=()=>{try{let d=JSON.parse(r.result);if(!Array.isArray(d.entries))throw Error();if(!confirm('Replace current diary data with this backup?'))return;data={...fresh(),...d};save();applyTheme();renderEntries();closeModal();toast('Backup restored')}catch(err){toast('This backup file is not valid')}};r.readAsText(f)}}
-function settingsPage(){let c=page('App settings','Privacy, PIN and installation options.');c.innerHTML=`<div class="tile"><strong>PIN lock</strong><p class="muted">Change your 4-digit PIN. Do not forget it — this starter cannot recover it.</p><button class="secondary" id="changePin">Change PIN</button></div><div class="tile" style="margin-top:10px"><strong>Install on Android</strong><p class="muted">After hosting over HTTPS, use Chrome menu → Install app / Add to Home screen.</p><button class="secondary" id="installBtn" ${installPrompt?'':'disabled'}>Install Dear Diary</button></div><div class="tile" style="margin-top:10px"><strong>Privacy & security</strong><p class="muted">PIN lock is not encryption. Data is stored in this browser on this device. There is no account or cloud sync in this version.</p></div>`;$('#changePin').onclick=()=>{let p=prompt('Enter a new 4-digit PIN');if(p&&/^\\d{4}$/.test(p)){data.pin=p;save();toast('PIN changed')}else if(p)toast('PIN must contain exactly 4 digits')};$('#installBtn').onclick=async()=>{if(installPrompt){installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;closeModal()}}}
+function settingsPage(){let c=page('App settings','Privacy, PIN and installation options.');c.innerHTML=`<div class="tile"><strong>PIN lock</strong><p class="muted">Change your 4-digit PIN. Do not forget it — this starter cannot recover it.</p><button class="secondary" id="changePin">Change PIN</button></div><div class="tile" style="margin-top:10px"><strong>Install on Android</strong><p class="muted">After hosting over HTTPS, use Chrome menu → Install app / Add to Home screen.</p><button class="secondary" id="installBtn" ${installPrompt?'':'disabled'}>Install Dear Diary</button></div><div class="tile" style="margin-top:10px"><strong>Google account & cloud sync</strong><p class="muted" id="accountStatus">Checking account…</p><button class="secondary" id="syncNow">Sync now</button> <button class="secondary" id="signOutGoogle">Sign out</button></div><div class="tile" style="margin-top:10px"><strong>Privacy & security</strong><p class="muted">PIN lock is not encryption. Data is stored in this browser on this device. Your PIN stays on this device. Diary data syncs to your private account when Google is connected.</p></div>`;$('#accountStatus').textContent=cloudUser?'Connected: '+(cloudUser.email||'Google account'):'Not connected';
+$('#syncNow').onclick=()=>syncCloud();
+$('#signOutGoogle').onclick=async()=>{if(supabaseClient){const {error}=await supabaseClient.auth.signOut();if(error)toast(error.message);else{cloudUser=null;cloudMsg('Cloud sync: not connected');$('#accountStatus').textContent='Not connected';toast('Signed out')}}};
+$('#changePin').onclick=()=>{let p=prompt('Enter a new 4-digit PIN');if(p&&/^\\d{4}$/.test(p)){data.pin=p;save();toast('PIN changed')}else if(p)toast('PIN must contain exactly 4 digits')};$('#installBtn').onclick=async()=>{if(installPrompt){installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;closeModal()}}}
 function statsPage(){let c=page('Your diary stats','A little look at your journaling journey.');let days=new Set(data.entries.map(e=>e.date)).size,words=data.entries.reduce((n,e)=>n+(e.body||'').trim().split(/\s+/).filter(Boolean).length,0),completed=Object.values(data.tasks).flat().filter(t=>t.done).length;c.innerHTML=`<div class="grid2"><div class="tile"><strong style="font-size:30px">${data.entries.length}</strong><span class="muted">Diary entries</span></div><div class="tile"><strong style="font-size:30px">${days}</strong><span class="muted">Days journaled</span></div><div class="tile"><strong style="font-size:30px">${words}</strong><span class="muted">Words written</span></div><div class="tile"><strong style="font-size:30px">${completed}</strong><span class="muted">Tasks completed</span></div></div>`}
-function setupLock(){let inputs=$$('.pin');pinStage=data.pin?'unlock':'create';$('#lockTitle').textContent=data.pin?'Welcome back':'Create your diary PIN';$('#lockHint').textContent=data.pin?'Enter your 4-digit PIN to open your diary.':'Create a 4-digit PIN to keep your diary private.';inputs.forEach((x,i)=>{x.value='';x.oninput=()=>{x.value=x.value.replace(/\D/g,'').slice(0,1);if(x.value&&inputs[i+1])inputs[i+1].focus()};x.onkeydown=e=>{if(e.key==='Backspace'&&!x.value&&inputs[i-1])inputs[i-1].focus()}});$('#unlockBtn').onclick=()=>{let p=inputs.map(x=>x.value).join('');if(!/^\d{4}$/.test(p)){toast('Enter all 4 digits');return}if(pinStage==='create'){data.pin=p;save();unlock()}else if(p===data.pin)unlock();else{toast('Incorrect PIN');inputs.forEach(x=>x.value='');inputs[0].focus()}}}
-function unlock(){$('#lockscreen').classList.add('hidden');applyTheme();updatePrompt();renderEntries();buildMenu()}
+function setupLock(){
+$('#googleLogin').onclick=async()=>{if(!supabaseClient){toast('Cloud service is unavailable');return}const {error}=await supabaseClient.auth.signInWithOAuth({provider:'google',options:{redirectTo:'https://ammu-dhanu-7.github.io/DIARY/'}});if(error)toast(error.message)};
+initCloud();
+let inputs=$$('.pin');pinStage=data.pin?'unlock':'create';$('#lockTitle').textContent=data.pin?'Welcome back':'Create your diary PIN';$('#lockHint').textContent=data.pin?'Enter your 4-digit PIN to open your diary.':'Create a 4-digit PIN to keep your diary private.';inputs.forEach((x,i)=>{x.value='';x.oninput=()=>{x.value=x.value.replace(/\D/g,'').slice(0,1);if(x.value&&inputs[i+1])inputs[i+1].focus()};x.onkeydown=e=>{if(e.key==='Backspace'&&!x.value&&inputs[i-1])inputs[i-1].focus()}});$('#unlockBtn').onclick=()=>{let p=inputs.map(x=>x.value).join('');if(!/^\d{4}$/.test(p)){toast('Enter all 4 digits');return}if(pinStage==='create'){data.pin=p;save();unlock()}else if(p===data.pin)unlock();else{toast('Incorrect PIN');inputs.forEach(x=>x.value='');inputs[0].focus()}}}
+function unlock(){$('#lockscreen').classList.add('hidden');applyTheme();updatePrompt();renderEntries();buildMenu();if(cloudUser)syncCloud({quiet:true})}
 $('#menuBtn').onclick=showDrawer;$('#closeDrawer').onclick=hideDrawer;$('#drawerBack').onclick=e=>{if(e.target===$('#drawerBack'))hideDrawer()};$('#closeModal').onclick=closeModal;$('#modalBack').onclick=e=>{if(e.target===$('#modalBack'))closeModal()};$('#newEntry').onclick=()=>entryForm();$('#searchBtn').onclick=()=>module('search');$$('[data-nav]').forEach(b=>b.onclick=()=>{if(b.dataset.nav==='diary'){closeModal();renderEntries()}else if(b.dataset.nav==='calendar')module('calendar');else if(b.dataset.nav==='stats')statsPage();else showDrawer()});
 window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e});
 window.addEventListener('appinstalled',()=>toast('Dear Diary installed ♥'));
