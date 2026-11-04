@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#eee6d9">
-<meta name="app-version" content="2026-11-04-corrected-1">
+<meta name="app-version" content="2026-11-04-habit-sync-dedup-2">
 <meta name="description" content="Dear Diary — a private journal and personal life organizer.">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
@@ -62,6 +62,35 @@ function taskFingerprint(t,period){
   return `${period}|${day}|${created||'no-time'}|${name}`;
 }
 function stableTaskId(fp){let h=2166136261;for(let i=0;i<fp.length;i++){h^=fp.charCodeAt(i);h=Math.imul(h,16777619)}return 'task-'+(h>>>0).toString(16)}
+// Habits created by older versions had no ID. Index-based cloud merge keys
+// changed on every merge and caused the same habits to multiply indefinitely.
+function normalizeHabitList(list){
+  const map=new Map();
+  for(const raw of (Array.isArray(list)?list:[])){
+    if(!raw||typeof raw!=='object'||!String(raw.name||'').trim())continue;
+    const h={...raw,name:String(raw.name).trim()};
+    const key=h.name.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,' ');
+    const id='habit-'+stableTaskId(key);
+    const prev=map.get(key);
+    if(prev){
+      prev.done=[...new Set([...(Array.isArray(prev.done)?prev.done:[]),...(Array.isArray(h.done)?h.done:[])])];
+      if(h.updatedAt&&(!prev.updatedAt||h.updatedAt>prev.updatedAt)){const done=prev.done;Object.assign(prev,h);prev.id=id;prev.done=done;}
+    }else map.set(key,{...h,id,done:[...new Set(Array.isArray(h.done)?h.done:[])]});
+  }
+  return [...map.values()];
+}
+// Older custom-tracker notes also lacked IDs. Give identical notes a repeatable ID.
+function normalizeCustomList(list){
+  const map=new Map();
+  for(const raw of (Array.isArray(list)?list:[])){
+    if(!raw||typeof raw!=='object'||!String(raw.name||'').trim())continue;
+    const x={...raw};
+    const fp=[x.name,x.value,x.date].map(v=>String(v||'').normalize('NFKC').trim().toLocaleLowerCase()).join('|');
+    x.id=x.id||('custom-'+stableTaskId(fp));
+    if(!map.has(x.id))map.set(x.id,x);
+  }
+  return [...map.values()];
+}
 function normalizeTaskLists(source){
   source.tasks=source.tasks&&typeof source.tasks==='object'?source.tasks:{};
   for(const period of ['daily','weekly','monthly']){
@@ -80,6 +109,8 @@ function normalizeTaskLists(source){
   return source;
 }
 data=normalizeTaskLists(data);
+data.habits=normalizeHabitList(data.habits);
+data.custom=normalizeCustomList(data.custom);
 function save(){try{localStorage.setItem(KEY,JSON.stringify(data))}catch(e){toast('Storage is full. Export a backup and remove large attachments.');}}
 // Cloud sync runs after local save; local storage remains the immediate safety copy.
 save = function(){ saveLocalOnly(); queueCloudSync(); };
@@ -90,9 +121,11 @@ let cloudUser=null, syncTimer=null, syncing=false, lastCloudSync=0;
 function cloudMsg(s){const el=$('#cloudStatus');if(el)el.textContent=s}
 function cloudPayload(){const copy=JSON.parse(JSON.stringify(data));delete copy.pin;copy.deletedEntryIds=[...new Set(copy.deletedEntryIds||[])];return copy}
 function mergeCloud(local,remote){
+  local={...local,habits:normalizeHabitList(local.habits),custom:normalizeCustomList(local.custom)};
+  remote={...remote,habits:normalizeHabitList(remote.habits),custom:normalizeCustomList(remote.custom)};
   const tombstones=new Set([...(remote.deletedEntryIds||[]),...(local.deletedEntryIds||[])]);
   const out={...remote,...local,deletedEntryIds:[...tombstones]};
-  const mapById=(a,b,key)=>{const m=new Map();[...(a||[]),...(b||[])].forEach((x,i)=>{const k=x.id||(key==='words'?`word:${wordKey(x.name)}`:`${key}:${x.createdAt||''}:${x.name||x.title||''}:${i}`);const prev=m.get(k);m.set(k,prev?{...prev,...x,done:!!(prev.done||x.done)}:x)});return [...m.values()]};
+  const mapById=(a,b,key)=>{const m=new Map();[...(a||[]),...(b||[])].forEach((x,i)=>{const k=x.id||(key==='words'?`word:${wordKey(x.name)}`:`${key}:${x.createdAt||''}:${x.name||x.title||''}:${i}`);const prev=m.get(k);if(!prev)m.set(k,{...x});else{const merged={...prev,...x};if(Array.isArray(prev.done)||Array.isArray(x.done))merged.done=[...new Set([...(Array.isArray(prev.done)?prev.done:[]),...(Array.isArray(x.done)?x.done:[])])];else if(typeof prev.done==='boolean'||typeof x.done==='boolean')merged.done=!!(prev.done||x.done);m.set(k,merged)}});return [...m.values()]};
   for(const k of ['entries','habits','custom','books','words','recipes']){
     if(k==='entries') out.entries=mapById(remote.entries,local.entries,k).filter(e=>!tombstones.has(e.id));
     else out[k]=mapById(remote[k],local[k],k);
@@ -193,8 +226,8 @@ function module(k){if(k==='themes')return themesPage();if(k==='fonts')return fon
 function themesPage(){let c=page('Choose your theme','15 calm palettes, from warm cream to soft charcoal.');c.innerHTML=`<div class="themegrid">${themes.map((t,i)=>`<button class="tile" data-theme="${i}"><div class="swatch ${i===data.theme?'selected':''}" style="background:linear-gradient(130deg,${t[1]},${t[4]})">${i===data.theme?'✓':''}</div><small>${i+1}. ${t[0]}</small></button>`).join('')}</div>`;$$('[data-theme]').forEach(b=>b.onclick=()=>{data.theme=+b.dataset.theme;save();applyTheme();themesPage()})}
 function fontsPage(){let c=page('Fonts & writing style','Choose your favourite reading and writing font.');let fs=['Georgia','Palatino Linotype','Times New Roman','Arial','Trebuchet MS','Courier New'];c.innerHTML=`<div class="field"><label>APP FONT</label><select id="fontPick">${fs.map(f=>`<option ${data.font===f?'selected':''}>${f}</option>`).join('')}</select></div><div class="tile" id="fontSample" style="font:24px ${data.font}">A little note to myself — every day is a new page.</div><button class="primary" id="saveFont">Apply font</button>`;$('#fontPick').onchange=e=>$('#fontSample').style.fontFamily=e.target.value;$('#saveFont').onclick=()=>{data.font=$('#fontPick').value;save();applyTheme();closeModal();toast('Font updated')}}
 function calendarPage(){let c=page('Calendar','Your saved diary entries by date.');c.innerHTML=`<div class="field"><label>MONTH</label><input id="calMonth" type="month" value="${new Date().toISOString().slice(0,7)}"></div><div class="calendar-grid" id="calGrid"></div><div id="calResults"></div>`;function draw(){let [y,m]=$('#calMonth').value.split('-').map(Number),first=new Date(y,m-1,1).getDay(),days=new Date(y,m,0).getDate(),has=new Set(data.entries.map(e=>e.date));let h=['S','M','T','W','T','F','S'].map(x=>`<div class="muted">${x}</div>`).join('');for(let i=0;i<first;i++)h+='<div></div>';for(let d=1;d<=days;d++){let key=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;h+=`<button class="calday ${has.has(key)?'has':''} ${key===new Date().toISOString().slice(0,10)?'today':''}" data-date="${key}">${d}${has.has(key)?' •':''}</button>`}$('#calGrid').innerHTML=h;$$('[data-date]').forEach(b=>b.onclick=()=>{let es=data.entries.filter(e=>e.date===b.dataset.date);$('#calResults').innerHTML=`<h3>${b.dataset.date}</h3>`+(es.map(e=>`<div class="listrow"><div><strong>${esc(e.title||'Untitled entry')}</strong><small>${esc(e.body.slice(0,90))}</small></div><button class="tiny" onclick="editEntry('${e.id}')">Open</button></div>`).join('')||'<p class="muted">No entry for this date.</p>')})}$('#calMonth').onchange=draw;draw()}
-function habitsPage(){let c=page('Habit tracker','Build gentle routines. Tick each habit every day.');c.innerHTML=`<div class="field"><label>NEW HABIT</label><input id="habitName" placeholder="e.g. Read 10 pages"></div><button class="primary" id="addHabit">Add habit</button><div id="habitRows"></div>`;function draw(){let d=new Date().toISOString().slice(0,10);$('#habitRows').innerHTML=data.habits.map((h,i)=>`<div class="listrow"><label class="checkrow"><input type="checkbox" ${h.done?.includes(d)?'checked':''} data-habit="${i}"><span>${esc(h.name)}<small>${h.done?.length||0} days completed</small></span></label><button class="tiny" data-hdel="${i}">Remove</button></div>`).join('')||'<p class="empty">Add your first habit.</p>';$$('[data-habit]').forEach(x=>x.onchange=()=>{let h=data.habits[+x.dataset.habit];h.done=h.done||[];h.done=x.checked?[...new Set([...h.done,d])]:h.done.filter(v=>v!==d);save();draw()});$$('[data-hdel]').forEach(x=>x.onclick=()=>{data.habits.splice(+x.dataset.hdel,1);save();draw()})}$('#addHabit').onclick=()=>{let n=$('#habitName').value.trim();if(n){data.habits.push({name:n,done:[]});save();$('#habitName').value='';draw()}};draw()}
-function customPage(){let c=page('Custom tracker','Track water, reading, mood, workouts or anything you choose.');c.innerHTML=`<div class="field"><label>TRACKER NAME</label><input id="customName" placeholder="e.g. Water intake"></div><div class="field"><label>VALUE / NOTE</label><input id="customValue" placeholder="e.g. 6 glasses"></div><button class="primary" id="addCustom">Save tracker note</button><div id="customRows"></div>`;function draw(){$('#customRows').innerHTML=data.custom.map((x,i)=>`<div class="listrow"><div><strong>${esc(x.name)}</strong><small>${esc(x.value)} · ${esc(x.date)}</small></div><button class="tiny" data-cdel="${i}">Delete</button></div>`).join('')}$('#addCustom').onclick=()=>{let n=$('#customName').value.trim();if(!n)return;data.custom.unshift({name:n,value:$('#customValue').value,date:new Date().toLocaleDateString()});save();draw()};c.addEventListener('click',e=>{if(e.target.dataset.cdel!==undefined){data.custom.splice(+e.target.dataset.cdel,1);save();draw()}});draw()}
+function habitsPage(){let c=page('Habit tracker','Build gentle routines. Tick each habit every day.');c.innerHTML=`<div class="field"><label>NEW HABIT</label><input id="habitName" placeholder="e.g. Read 10 pages"></div><button class="primary" id="addHabit">Add habit</button><div id="habitRows"></div>`;function draw(){let d=new Date().toISOString().slice(0,10);$('#habitRows').innerHTML=data.habits.map((h,i)=>`<div class="listrow"><label class="checkrow"><input type="checkbox" ${h.done?.includes(d)?'checked':''} data-habit="${i}"><span>${esc(h.name)}<small>${h.done?.length||0} days completed</small></span></label><button class="tiny" data-hdel="${i}">Remove</button></div>`).join('')||'<p class="empty">Add your first habit.</p>';$$('[data-habit]').forEach(x=>x.onchange=()=>{let h=data.habits[+x.dataset.habit];h.done=h.done||[];h.done=x.checked?[...new Set([...h.done,d])]:h.done.filter(v=>v!==d);save();draw()});$$('[data-hdel]').forEach(x=>x.onclick=()=>{data.habits.splice(+x.dataset.hdel,1);save();draw()})}$('#addHabit').onclick=()=>{let n=$('#habitName').value.trim();if(n){data.habits.push({id:'habit-'+stableTaskId(n.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,' ')),name:n,done:[]});data.habits=normalizeHabitList(data.habits);save();$('#habitName').value='';draw()}};draw()}
+function customPage(){let c=page('Custom tracker','Track water, reading, mood, workouts or anything you choose.');c.innerHTML=`<div class="field"><label>TRACKER NAME</label><input id="customName" placeholder="e.g. Water intake"></div><div class="field"><label>VALUE / NOTE</label><input id="customValue" placeholder="e.g. 6 glasses"></div><button class="primary" id="addCustom">Save tracker note</button><div id="customRows"></div>`;function draw(){$('#customRows').innerHTML=data.custom.map((x,i)=>`<div class="listrow"><div><strong>${esc(x.name)}</strong><small>${esc(x.value)} · ${esc(x.date)}</small></div><button class="tiny" data-cdel="${i}">Delete</button></div>`).join('')}$('#addCustom').onclick=()=>{let n=$('#customName').value.trim();if(!n)return;data.custom.unshift({id:'custom-'+stableTaskId([n,$('#customValue').value,new Date().toLocaleDateString()].join('|')),name:n,value:$('#customValue').value,date:new Date().toLocaleDateString()});save();draw()};c.addEventListener('click',e=>{if(e.target.dataset.cdel!==undefined){data.custom.splice(+e.target.dataset.cdel,1);save();draw()}});draw()}
 function simpleList(title,key,placeholder,detail){let c=page(title,'Keep useful notes in one place.');c.innerHTML=`<div class="field"><label>${placeholder.toUpperCase()}</label><input id="itemName" placeholder="${placeholder}"></div><div class="field"><label>${detail.toUpperCase()}</label><textarea id="itemDetail" placeholder="${detail}"></textarea></div><button class="primary" id="addItem">Save</button><div id="items"></div>`;function draw(){$('#items').innerHTML=(data[key]||[]).map((x,i)=>`<div class="listrow"><div><strong>${esc(x.name)}</strong><small>${esc(x.detail)}</small></div><button class="tiny" data-del="${i}">Delete</button></div>`).join('')||'<div class="empty">Nothing saved here yet.</div>'}$('#addItem').onclick=()=>{let n=$('#itemName').value.trim();if(!n)return;if(key==='words'){const existing=(data.words||[]).find(x=>wordKey(x.name)===wordKey(n));if(existing){toast('That word is already in your dictionary');return}data.words.unshift({id:crypto.randomUUID(),name:n,detail:$('#itemDetail').value})}else data[key].unshift({id:crypto.randomUUID(),name:n,detail:$('#itemDetail').value});save();$('#itemName').value='';$('#itemDetail').value='';draw()};c.addEventListener('click',e=>{if(e.target.dataset.del!==undefined){data[key].splice(+e.target.dataset.del,1);save();draw()}});draw()}
 function todoPage(period){
  const title={daily:'Daily to-do list',weekly:'Weekly to-do list',monthly:'Monthly to-do list'}[period];
