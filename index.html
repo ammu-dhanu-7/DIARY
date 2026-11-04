@@ -53,7 +53,33 @@ const prompts=Array.from({length:365},(_,i)=>`${openers[i%openers.length]} ${top
 const menu=[['Themes','🎨','themes'],['Fonts & writing style','Aa','fonts'],['Calendar','▦','calendar'],['Habit tracker','✓','habits'],['Custom tracker','◉','custom'],['Bookshelf','▤','books'],['Daily to-do list','☑','daily'],['Weekly to-do list','▦','weekly'],['Monthly to-do list','▣','monthly'],['Dictionary / New words','✎','words'],['Cooking guide & recipes','♨','cooking'],['Search diary','⌕','search'],['Storage & backup','▣','storage'],['App settings','⚙','settings']];
 function fresh(){return {entries:[],tasks:{daily:[],weekly:[],monthly:[]},habits:[],custom:[],books:[],words:[],recipes:[],theme:0,font:'Georgia',pin:null,sticker:'',promptSeed:0}}
 function load(){try{return {...fresh(),...JSON.parse(localStorage.getItem(KEY)||'{}')}}catch(e){return fresh()}}
-let data=load(),pinStage='unlock',recording=null,voiceData='',entryImage='',installPrompt=null;for(const p of ['daily','weekly','monthly']){data.tasks[p]=data.tasks[p]||[];data.tasks[p].forEach(t=>{if(!t.id)t.id=crypto.randomUUID()})}
+let data=load(),pinStage='unlock',recording=null,voiceData='',entryImage='',installPrompt=null;
+// Give legacy tasks a stable identity and remove copies created by repeated cloud merges.
+function taskFingerprint(t,period){
+  const day=String(t.periodKey||((t.createdAt||'').slice(0,10))||'').slice(0,10);
+  const name=String(t.name||'').normalize('NFKC').trim().toLocaleLowerCase().replace(/\s+/g,' ');
+  const created=String(t.createdAt||'');
+  return `${period}|${day}|${created||'no-time'}|${name}`;
+}
+function stableTaskId(fp){let h=2166136261;for(let i=0;i<fp.length;i++){h^=fp.charCodeAt(i);h=Math.imul(h,16777619)}return 'task-'+(h>>>0).toString(16)}
+function normalizeTaskLists(source){
+  source.tasks=source.tasks&&typeof source.tasks==='object'?source.tasks:{};
+  for(const period of ['daily','weekly','monthly']){
+    const input=Array.isArray(source.tasks[period])?source.tasks[period]:[];
+    const seen=new Map();
+    for(const raw of input){
+      if(!raw||typeof raw!=='object'||!String(raw.name||'').trim())continue;
+      const t={...raw};
+      if(!t.periodKey){const d=(t.createdAt||'').slice(0,10)||new Date().toISOString().slice(0,10);if(period==='daily')t.periodKey=d;else if(period==='monthly')t.periodKey=d.slice(0,7);else{const x=new Date(d+'T12:00:00');x.setDate(x.getDate()-(x.getDay()+6)%7);t.periodKey=x.toISOString().slice(0,10)}}
+      const fp=taskFingerprint(t,period),previous=seen.get(fp);
+      if(previous){previous.done=!!(previous.done||t.done);if(!previous.id&&t.id)previous.id=t.id;}
+      else{t.id=t.id||stableTaskId(fp);seen.set(fp,t)}
+    }
+    source.tasks[period]=[...seen.values()];
+  }
+  return source;
+}
+data=normalizeTaskLists(data);
 function save(){try{localStorage.setItem(KEY,JSON.stringify(data))}catch(e){toast('Storage is full. Export a backup and remove large attachments.');}}
 // Cloud sync runs after local save; local storage remains the immediate safety copy.
 save = function(){ saveLocalOnly(); queueCloudSync(); };
@@ -73,7 +99,17 @@ function mergeCloud(local,remote){
   }
   out.words=dedupeWords(out.words);
   out.tasks={...(remote.tasks||{}),...(local.tasks||{})};
-  for(const k of ['daily','weekly','monthly'])out.tasks[k]=mapById((remote.tasks||{})[k],(local.tasks||{})[k],k);
+  const normalizedRemote=normalizeTaskLists({tasks:remote.tasks||{}}).tasks;
+  const normalizedLocal=normalizeTaskLists({tasks:local.tasks||{}}).tasks;
+  for(const k of ['daily','weekly','monthly']){
+    const merged=new Map();
+    for(const t of [...normalizedRemote[k],...normalizedLocal[k]]){
+      const fp=taskFingerprint(t,k),prev=merged.get(fp);
+      if(prev){prev.done=!!(prev.done||t.done);prev.id=prev.id||t.id;}
+      else merged.set(fp,{...t,id:t.id||stableTaskId(fp)});
+    }
+    out.tasks[k]=[...merged.values()];
+  }
   out.pin=local.pin||null;
   return out;
 }
@@ -106,6 +142,8 @@ data.words=dedupeWords(data.words);
 saveLocalOnly();
 function saveLocalOnly(){try{localStorage.setItem(KEY,JSON.stringify(data))}catch(e){toast('Storage is full. Export a backup and remove large attachments.');}}
 function queueCloudSync(){if(!cloudUser)return;clearTimeout(syncTimer);syncTimer=setTimeout(()=>syncCloud({quiet:true}),1800)}
+// Save the one-time duplicate cleanup locally before cloud sync starts.
+saveLocalOnly();
 async function initCloud(){
   if(!supabaseClient){cloudMsg('Cloud service could not load');return}
   const {data:{session}}=await supabaseClient.auth.getSession();
@@ -161,7 +199,7 @@ function simpleList(title,key,placeholder,detail){let c=page(title,'Keep useful 
 function todoPage(period){
  const title={daily:'Daily to-do list',weekly:'Weekly to-do list',monthly:'Monthly to-do list'}[period];
  let selected=new Date().toISOString().slice(0,10);
- data.tasks[period]=Array.isArray(data.tasks[period])?data.tasks[period]:[];
+ data=normalizeTaskLists(data);data.tasks[period]=Array.isArray(data.tasks[period])?data.tasks[period]:[];
  const monday=d=>{const x=new Date(d+'T12:00:00');x.setDate(x.getDate()-(x.getDay()+6)%7);return x.toISOString().slice(0,10)};
  const keyFor=d=>period==='daily'?d:period==='weekly'?monday(d):d.slice(0,7);
  // Migrate older tasks without a period key without deleting or resetting them.
