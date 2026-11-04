@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#eee6d9">
-<meta name="app-version" content="2026-11-04-habit-sync-dedup-2">
+<meta name="app-version" content="2026-11-04-habit-cloud-repair-3">
 <meta name="description" content="Dear Diary — a private journal and personal life organizer.">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
@@ -64,17 +64,23 @@ function taskFingerprint(t,period){
 function stableTaskId(fp){let h=2166136261;for(let i=0;i<fp.length;i++){h^=fp.charCodeAt(i);h=Math.imul(h,16777619)}return 'task-'+(h>>>0).toString(16)}
 // Habits created by older versions had no ID. Index-based cloud merge keys
 // changed on every merge and caused the same habits to multiply indefinitely.
+function habitKey(value){
+  // Ignore invisible Unicode marks that can make visually identical names differ.
+  return String(value||'').normalize('NFKC').replace(/[\u200B-\u200D\u2060\uFEFF]/g,'').trim().toLocaleLowerCase().replace(/\s+/g,' ');
+}
 function normalizeHabitList(list){
   const map=new Map();
   for(const raw of (Array.isArray(list)?list:[])){
     if(!raw||typeof raw!=='object'||!String(raw.name||'').trim())continue;
-    const h={...raw,name:String(raw.name).trim()};
-    const key=h.name.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,' ');
+    const h={...raw,name:String(raw.name).normalize('NFKC').replace(/[\u200B-\u200D\u2060\uFEFF]/g,'').trim()};
+    const key=habitKey(h.name);
+    if(!key)continue;
     const id='habit-'+stableTaskId(key);
     const prev=map.get(key);
     if(prev){
-      prev.done=[...new Set([...(Array.isArray(prev.done)?prev.done:[]),...(Array.isArray(h.done)?h.done:[])])];
-      if(h.updatedAt&&(!prev.updatedAt||h.updatedAt>prev.updatedAt)){const done=prev.done;Object.assign(prev,h);prev.id=id;prev.done=done;}
+      const done=[...new Set([...(Array.isArray(prev.done)?prev.done:[]),...(Array.isArray(h.done)?h.done:[])])];
+      const newest=h.updatedAt&&(!prev.updatedAt||h.updatedAt>prev.updatedAt)?h:prev;
+      map.set(key,{...prev,...newest,id,done});
     }else map.set(key,{...h,id,done:[...new Set(Array.isArray(h.done)?h.done:[])]});
   }
   return [...map.values()];
@@ -154,7 +160,21 @@ async function syncCloud({quiet=false}={}){
     const {data:row,error}=await supabaseClient.from('diary_data').select('payload,updated_at').eq('user_id',cloudUser.id).maybeSingle();
     if(error)throw error;
     if(row?.payload){
+      // The signed-out device copy is the source of truth for the habit list.
+      // Keep only those local habit names, while retaining completion dates
+      // from matching cloud duplicates, then write the compact list back once.
+      const localHabitList=normalizeHabitList(data.habits);
+      const remoteHabitList=normalizeHabitList(row.payload.habits);
+      const remoteByName=new Map(remoteHabitList.map(h=>[habitKey(h.name),h]));
+      const safeHabits=localHabitList.map(localHabit=>{
+        const remoteHabit=remoteByName.get(habitKey(localHabit.name));
+        return normalizeHabitList([{...(remoteHabit||{}),...localHabit,
+          id:localHabit.id,
+          done:[...new Set([...(Array.isArray(localHabit.done)?localHabit.done:[]),...(Array.isArray(remoteHabit?.done)?remoteHabit.done:[])])]
+        }])[0];
+      }).filter(Boolean);
       data=mergeCloud(data,row.payload);
+      data.habits=normalizeHabitList(safeHabits);
       saveLocalOnly();
       const {error:upErr}=await supabaseClient.from('diary_data').upsert({user_id:cloudUser.id,payload:cloudPayload(),updated_at:new Date().toISOString()},{onConflict:'user_id'});
       if(upErr)throw upErr;
